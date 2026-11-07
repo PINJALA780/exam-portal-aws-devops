@@ -1,5 +1,5 @@
 
-name: Exam Portal CI/CD 
+name: Exam Portal CI/CD
 
 on:
   push:
@@ -25,13 +25,38 @@ env:
   WEBSITE_URL: https://d2ulirdq336tyh.cloudfront.net
 
 jobs:
-  deploy:
-    name: Test, Build and Deploy
+  test:
+    name: Test Application
     runs-on: ubuntu-latest
-    timeout-minutes: 40
+
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_DB: examportal_test
+          POSTGRES_USER: examtest
+          POSTGRES_PASSWORD: examtest_password
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U examtest -d examportal_test"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    env:
+      DB_HOST: localhost
+      DB_PORT: "5432"
+      DB_NAME: examportal_test
+      DB_USER: examtest
+      DB_PASSWORD: examtest_password
+      DB_SSL: "false"
+      JWT_SECRET: ci-test-jwt-secret-only
+      PORT: "5001"
+      NODE_ENV: test
 
     steps:
-      - name: Checkout source code
+      - name: Checkout code
         uses: actions/checkout@v4
 
       - name: Set up Node.js
@@ -43,13 +68,50 @@ jobs:
             backend/package-lock.json
             frontend/package-lock.json
 
+      - name: Install backend dependencies
+        working-directory: backend
+        run: npm ci
+
+      - name: Run database migrations
+        working-directory: backend
+        run: node src/migrate.js
+
+      - name: Start backend
+        working-directory: backend
+        run: |
+          node src/server.js > /tmp/exam-api.log 2>&1 &
+          echo $! > /tmp/exam-api.pid
+
+      - name: Wait for backend
+        run: |
+          for i in $(seq 1 30); do
+            if curl -fsS \
+              http://localhost:5001/api/health; then
+              exit 0
+            fi
+            sleep 2
+          done
+
+          cat /tmp/exam-api.log
+          exit 1
+
       - name: Run backend tests
         working-directory: backend
         run: |
-          npm ci
-          npm test
+          node --test \
+            tests/daily-learning-records.test.js \
+            tests/domain-selection.test.js \
+            tests/student-id.test.js \
+            tests/exam-start-flow.test.js
 
-      - name: Build React frontend
+      - name: Show backend logs on failure
+        if: failure()
+        run: |
+          if [ -f /tmp/exam-api.log ]; then
+            tail -100 /tmp/exam-api.log
+          fi
+
+      - name: Build frontend
         working-directory: frontend
         env:
           VITE_API_URL: /api
@@ -57,10 +119,35 @@ jobs:
           npm ci
           npm run build
 
-          if grep -R -q 'http://localhost:5000/api' dist/assets; then
-            echo "Invalid localhost API address found"
+          if grep -R -q \
+            'http://localhost:5000/api' dist/assets; then
+            echo "Invalid production API URL"
             exit 1
           fi
+
+      - name: Upload frontend build
+        uses: actions/upload-artifact@v4
+        with:
+          name: frontend-build
+          path: frontend/dist/
+          retention-days: 1
+
+  deploy:
+    name: Deploy to AWS
+    needs: test
+    runs-on: ubuntu-latest
+    environment: staging
+    timeout-minutes: 40
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Download frontend build
+        uses: actions/download-artifact@v4
+        with:
+          name: frontend-build
+          path: frontend/dist/
 
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v6.3.0
@@ -100,8 +187,10 @@ jobs:
             --output json > task-current.json
 
           jq -e --arg image "$IMAGE_URI" '
-            if ([.containerDefinitions[].name] | index("backend")) == null
-            then error("Backend container not found")
+            if ([.containerDefinitions[].name] |
+                index("backend")) == null
+            then
+              error("Backend container not found")
             else
               del(
                 .taskDefinitionArn,
@@ -128,13 +217,10 @@ jobs:
           cluster: ${{ env.ECS_CLUSTER }}
           service: ${{ env.ECS_SERVICE }}
           wait-for-service-stability: true
-          wait-max-delay-seconds: 15
           wait-for-minutes: 20
 
       - name: Upload frontend to S3
         run: |
-          set -euo pipefail
-
           aws s3 sync frontend/dist/ \
             "s3://$S3_BUCKET/" \
             --region "$AWS_REGION"
@@ -142,28 +228,23 @@ jobs:
           aws s3 cp frontend/dist/index.html \
             "s3://$S3_BUCKET/index.html" \
             --content-type "text/html" \
-            --cache-control "no-cache, max-age=0, must-revalidate" \
-            --region "$AWS_REGION"
+            --cache-control "no-cache, max-age=0, must-revalidate"
 
-      - name: Invalidate CloudFront cache
+      - name: Refresh CloudFront
         run: |
-          set -euo pipefail
-
           ID=$(aws cloudfront create-invalidation \
             --distribution-id "$CLOUDFRONT_ID" \
             --paths "/" "/index.html" \
-            --query "Invalidation.Id" \
+            --query 'Invalidation.Id' \
             --output text)
 
           aws cloudfront wait invalidation-completed \
             --distribution-id "$CLOUDFRONT_ID" \
             --id "$ID"
 
-      - name: Verify application health
+      - name: Verify deployment
         run: |
-          set -euo pipefail
-
-          curl --fail --silent --show-error \
+          curl -fsS \
             --retry 5 \
             --retry-delay 5 \
             "$WEBSITE_URL/api/health" | tee health.json
