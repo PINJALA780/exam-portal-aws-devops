@@ -642,10 +642,10 @@ Screenshots are uploaded manually into `docs/screenshots/`.
 
 ## Project Credits
 
-**Original Application Development:**  
+**Original Application Development:**
 https://github.com/yugandhar0050/test-_demo
 
-**AWS Cloud Infrastructure, DevOps Deployment, Monitoring and Performance Testing:**  
+**AWS Cloud Infrastructure, DevOps Deployment, Monitoring and Performance Testing:**
 https://github.com/PINJALA780
 
 This repository documents my AWS cloud engineering and DevOps implementation of the Exam Portal application.
