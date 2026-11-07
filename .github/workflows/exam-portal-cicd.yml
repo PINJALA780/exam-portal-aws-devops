@@ -3,7 +3,8 @@ name: Exam Portal CI/CD
 
 on:
   push:
-    branches: [main]
+    branches:
+      - main
   workflow_dispatch:
 
 permissions:
@@ -28,6 +29,7 @@ jobs:
   test:
     name: Test Application
     runs-on: ubuntu-latest
+    timeout-minutes: 20
 
     services:
       postgres:
@@ -56,7 +58,7 @@ jobs:
       NODE_ENV: test
 
     steps:
-      - name: Checkout code
+      - name: Checkout source code
         uses: actions/checkout@v4
 
       - name: Set up Node.js
@@ -76,22 +78,22 @@ jobs:
         working-directory: backend
         run: node src/migrate.js
 
-      - name: Start backend
+      - name: Start backend API
         working-directory: backend
         run: |
           node src/server.js > /tmp/exam-api.log 2>&1 &
           echo $! > /tmp/exam-api.pid
 
-      - name: Wait for backend
+      - name: Wait for backend API
         run: |
           for i in $(seq 1 30); do
-            if curl -fsS \
-              http://localhost:5001/api/health; then
+            if curl -fsS http://localhost:5001/api/health; then
               exit 0
             fi
             sleep 2
           done
 
+          echo "Backend failed to start"
           cat /tmp/exam-api.log
           exit 1
 
@@ -104,14 +106,14 @@ jobs:
             tests/student-id.test.js \
             tests/exam-start-flow.test.js
 
-      - name: Show backend logs on failure
+      - name: Show backend logs if tests fail
         if: failure()
         run: |
           if [ -f /tmp/exam-api.log ]; then
             tail -100 /tmp/exam-api.log
           fi
 
-      - name: Build frontend
+      - name: Build React frontend
         working-directory: frontend
         env:
           VITE_API_URL: /api
@@ -121,7 +123,7 @@ jobs:
 
           if grep -R -q \
             'http://localhost:5000/api' dist/assets; then
-            echo "Invalid production API URL"
+            echo "Invalid localhost API URL detected"
             exit 1
           fi
 
@@ -140,7 +142,7 @@ jobs:
     timeout-minutes: 40
 
     steps:
-      - name: Checkout code
+      - name: Checkout source code
         uses: actions/checkout@v4
 
       - name: Download frontend build
@@ -167,6 +169,18 @@ jobs:
           ECR_REGISTRY: ${{ steps.ecr.outputs.registry }}
         run: |
           set -euo pipefail
+
+          mkdir -p backend/certs
+
+          curl --fail --silent --show-error \
+            --location --retry 3 \
+            https://truststore.pki.rds.amazonaws.com/global/global-bundle.pem \
+            --output backend/certs/global-bundle.pem
+
+          test -s backend/certs/global-bundle.pem
+
+          grep -q "BEGIN CERTIFICATE" \
+            backend/certs/global-bundle.pem
 
           IMAGE="$ECR_REGISTRY/$ECR_REPOSITORY:$GITHUB_SHA"
 
@@ -217,10 +231,13 @@ jobs:
           cluster: ${{ env.ECS_CLUSTER }}
           service: ${{ env.ECS_SERVICE }}
           wait-for-service-stability: true
+          wait-max-delay-seconds: 15
           wait-for-minutes: 20
 
       - name: Upload frontend to S3
         run: |
+          set -euo pipefail
+
           aws s3 sync frontend/dist/ \
             "s3://$S3_BUCKET/" \
             --region "$AWS_REGION"
@@ -228,11 +245,14 @@ jobs:
           aws s3 cp frontend/dist/index.html \
             "s3://$S3_BUCKET/index.html" \
             --content-type "text/html" \
-            --cache-control "no-cache, max-age=0, must-revalidate"
+            --cache-control "no-cache, max-age=0, must-revalidate" \
+            --region "$AWS_REGION"
 
-      - name: Refresh CloudFront
+      - name: Invalidate CloudFront cache
         run: |
-          ID=$(aws cloudfront create-invalidation \
+          set -euo pipefail
+
+          INVALIDATION_ID=$(aws cloudfront create-invalidation \
             --distribution-id "$CLOUDFRONT_ID" \
             --paths "/" "/index.html" \
             --query 'Invalidation.Id' \
@@ -240,11 +260,13 @@ jobs:
 
           aws cloudfront wait invalidation-completed \
             --distribution-id "$CLOUDFRONT_ID" \
-            --id "$ID"
+            --id "$INVALIDATION_ID"
 
-      - name: Verify deployment
+      - name: Verify application health
         run: |
-          curl -fsS \
+          set -euo pipefail
+
+          curl --fail --silent --show-error \
             --retry 5 \
             --retry-delay 5 \
             "$WEBSITE_URL/api/health" | tee health.json
